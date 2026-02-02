@@ -1,0 +1,21 @@
+{
+  "name": "moltr-token-launcher",
+  "version": "1.0.0",
+  "description": "Moltbook bot that launches tokens on Clanker V4 via !moltr command",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "clanker-sdk": "^4.0.0",
+    "viem": "^2.0.0",
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Molterator",
+  "license": "MIT"
+}
