@@ -4,16 +4,16 @@
  * Monitors Moltbook for !moltr commands and auto-launches tokens on Clanker V4
  * Fee split: 80% to token creator, 20% to deployer (you)
  * 
- * Command format on Moltbook:
+ * Command format:
  * !moltr $TICKER TokenName "Description" https://image.png https://website.com 0xWallet
  */
 
-import { Clanker } from 'clanker-sdk/v4';
-import { createWalletClient, createPublicClient, privateKeyToAccount, http } from 'viem';
+import { createWalletClient, createPublicClient, http, encodeFunctionData, parseEther } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 import { base } from 'viem/chains';
 
 // ============================================
-// CONFIGURATION - UPDATE THESE VALUES
+// CONFIGURATION
 // ============================================
 const CONFIG = {
     DEPLOYER_PRIVATE_KEY: process.env.DEPLOYER_PRIVATE_KEY || '0x_YOUR_PRIVATE_KEY_HERE',
@@ -21,71 +21,93 @@ const CONFIG = {
     MOLTBOOK_API_KEY: process.env.MOLTBOOK_API_KEY || 'your_moltbook_api_key',
     MOLTBOOK_API_URL: 'https://www.moltbook.com/api/v1',
     POLL_INTERVAL_MS: 30000,
-    CHAIN: base,
     RPC_URL: process.env.RPC_URL || 'https://mainnet.base.org',
-    CREATOR_FEE_BPS: 8000,
-    DEPLOYER_FEE_BPS: 2000,
+    CREATOR_FEE_BPS: 8000,  // 80%
+    DEPLOYER_FEE_BPS: 2000, // 20%
 };
 
+// Clanker V4 Factory Contract on Base
+const CLANKER_FACTORY = '0x375C15db32D28cEcdcAB5C03Ab889bf15cbD2c5E';
+
+// Simplified ABI for token deployment
+const CLANKER_ABI = [
+    {
+        "inputs": [
+            {
+                "components": [
+                    { "name": "name", "type": "string" },
+                    { "name": "symbol", "type": "string" },
+                    { "name": "image", "type": "string" },
+                    { "name": "metadata", "type": "string" },
+                    { "name": "context", "type": "string" },
+                    { "name": "tokenAdmin", "type": "address" },
+                    {
+                        "name": "rewardRecipients",
+                        "type": "tuple[]",
+                        "components": [
+                            { "name": "recipient", "type": "address" },
+                            { "name": "admin", "type": "address" },
+                            { "name": "bps", "type": "uint16" },
+                            { "name": "tokenType", "type": "uint8" }
+                        ]
+                    }
+                ],
+                "name": "params",
+                "type": "tuple"
+            }
+        ],
+        "name": "deployToken",
+        "outputs": [{ "name": "token", "type": "address" }],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }
+];
+
 // ============================================
-// CLANKER SDK SETUP
+// VIEM SETUP
 // ============================================
 const account = privateKeyToAccount(CONFIG.DEPLOYER_PRIVATE_KEY);
 
 const publicClient = createPublicClient({
-    chain: CONFIG.CHAIN,
+    chain: base,
     transport: http(CONFIG.RPC_URL),
 });
 
 const walletClient = createWalletClient({
     account,
-    chain: CONFIG.CHAIN,
+    chain: base,
     transport: http(CONFIG.RPC_URL),
 });
 
-const clanker = new Clanker({
-    publicClient,
-    wallet: walletClient,
-});
-
 // ============================================
-// MOLTBOOK API HELPERS
+// MOLTBOOK API
 // ============================================
-const moltbookHeaders = {
+const headers = {
     'Authorization': `Bearer ${CONFIG.MOLTBOOK_API_KEY}`,
     'Content-Type': 'application/json',
 };
 
 async function fetchRecentPosts(limit = 50) {
     try {
-        const response = await fetch(
-            `${CONFIG.MOLTBOOK_API_URL}/posts?limit=${limit}&sort=newest`,
-            { headers: moltbookHeaders }
-        );
-        if (!response.ok) throw new Error(`Moltbook API error: ${response.status}`);
-        const data = await response.json();
+        const res = await fetch(`${CONFIG.MOLTBOOK_API_URL}/posts?limit=${limit}&sort=newest`, { headers });
+        if (!res.ok) throw new Error(`API error: ${res.status}`);
+        const data = await res.json();
         return data.posts || [];
-    } catch (error) {
-        console.error('Error fetching posts:', error.message);
+    } catch (e) {
+        console.error('Fetch error:', e.message);
         return [];
     }
 }
 
 async function replyToPost(postId, content) {
     try {
-        const response = await fetch(
-            `${CONFIG.MOLTBOOK_API_URL}/comments`,
-            {
-                method: 'POST',
-                headers: moltbookHeaders,
-                body: JSON.stringify({ post_id: postId, content }),
-            }
-        );
-        if (!response.ok) throw new Error(`Failed to reply: ${response.status}`);
-        return await response.json();
-    } catch (error) {
-        console.error('Error replying to post:', error.message);
-        return null;
+        await fetch(`${CONFIG.MOLTBOOK_API_URL}/comments`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ post_id: postId, content }),
+        });
+    } catch (e) {
+        console.error('Reply error:', e.message);
     }
 }
 
@@ -95,191 +117,176 @@ async function replyToPost(postId, content) {
 function parseMoltrCommand(content) {
     if (!content.toLowerCase().includes('!moltr')) return null;
     
-    const tickerPattern = /\$([A-Z0-9]+)/i;
-    const imagePattern = /(https?:\/\/[^\s]+\.(png|jpg|jpeg|gif|webp))/i;
-    const descriptionPattern = /"([^"]+)"/;
-    const walletPattern = /(0x[a-fA-F0-9]{40})/;
+    const tickerMatch = content.match(/\$([A-Z0-9]+)/i);
+    if (!tickerMatch) return { error: 'Missing ticker ($TICKER)' };
     
-    const tickerMatch = content.match(tickerPattern);
-    if (!tickerMatch) return { error: 'Missing ticker (use $TICKER format)' };
-    const ticker = tickerMatch[1].toUpperCase();
+    const walletMatch = content.match(/(0x[a-fA-F0-9]{40})/);
+    if (!walletMatch) return { error: 'Missing wallet (0x...)' };
     
-    const walletMatch = content.match(walletPattern);
-    if (!walletMatch) return { error: 'Missing wallet address (use 0x... format)' };
-    const walletAddress = walletMatch[1];
+    const imageMatch = content.match(/(https?:\/\/[^\s]+\.(png|jpg|jpeg|gif|webp))/i);
+    const descMatch = content.match(/"([^"]+)"/);
     
-    const imageMatch = content.match(imagePattern);
-    const imageUrl = imageMatch ? imageMatch[1] : null;
-    
-    // Find website URL (any URL that's not an image)
     const urlPattern = /https?:\/\/[^\s]+/gi;
     const allUrls = content.match(urlPattern) || [];
-    const websiteUrl = allUrls.find(url => 
-        !url.match(/\.(png|jpg|jpeg|gif|webp)$/i)
-    ) || null;
-    
-    const descMatch = content.match(descriptionPattern);
-    const description = descMatch ? descMatch[1] : `${ticker} token launched via Molterator on Moltbook`;
+    const websiteUrl = allUrls.find(u => !u.match(/\.(png|jpg|jpeg|gif|webp)$/i)) || null;
     
     const afterTicker = content.split(tickerMatch[0])[1] || '';
     const nameMatch = afterTicker.trim().match(/^([A-Za-z0-9]+)/);
-    const name = nameMatch ? nameMatch[1] : ticker;
     
-    return { ticker, name, description, imageUrl, websiteUrl, walletAddress };
+    return {
+        ticker: tickerMatch[1].toUpperCase(),
+        name: nameMatch ? nameMatch[1] : tickerMatch[1].toUpperCase(),
+        description: descMatch ? descMatch[1] : `${tickerMatch[1]} launched via Molterator`,
+        imageUrl: imageMatch ? imageMatch[1] : '',
+        websiteUrl,
+        walletAddress: walletMatch[1],
+    };
 }
 
 // ============================================
 // TOKEN DEPLOYMENT
 // ============================================
 async function deployToken(tokenData, creatorAddress) {
-    console.log(`\n🦞 Deploying token: ${tokenData.name} ($${tokenData.ticker})`);
+    console.log(`\n🦞 Deploying: ${tokenData.name} ($${tokenData.ticker})`);
     console.log(`   Creator: ${creatorAddress}`);
-    console.log(`   Description: ${tokenData.description}`);
-    console.log(`   Image: ${tokenData.imageUrl || 'none'}`);
-    console.log(`   Website: ${tokenData.websiteUrl || 'none'}`);
     
     try {
-        const socialMediaUrls = ['https://moltbook.com'];
-        if (tokenData.websiteUrl) socialMediaUrls.unshift(tokenData.websiteUrl);
+        // Build metadata JSON
+        const metadata = JSON.stringify({
+            description: tokenData.description,
+            socialMediaUrls: tokenData.websiteUrl ? [tokenData.websiteUrl, 'https://moltbook.com'] : ['https://moltbook.com'],
+        });
         
-        const deployConfig = {
+        const context = JSON.stringify({
+            interface: 'Molterator Bot',
+            platform: 'moltbook',
+        });
+        
+        // Reward recipients: 80% creator, 20% deployer
+        const rewardRecipients = [
+            {
+                recipient: creatorAddress,
+                admin: creatorAddress,
+                bps: CONFIG.CREATOR_FEE_BPS,
+                tokenType: 1, // Paired (WETH)
+            },
+            {
+                recipient: CONFIG.DEPLOYER_ADDRESS,
+                admin: CONFIG.DEPLOYER_ADDRESS,
+                bps: CONFIG.DEPLOYER_FEE_BPS,
+                tokenType: 1, // Paired (WETH)
+            },
+        ];
+        
+        const deployParams = {
             name: tokenData.name,
             symbol: tokenData.ticker,
+            image: tokenData.imageUrl || '',
+            metadata,
+            context,
             tokenAdmin: creatorAddress,
-            metadata: {
-                description: tokenData.description,
-                socialMediaUrls: socialMediaUrls,
-            },
-            context: {
-                interface: 'Molterator Bot',
-                platform: 'moltbook',
-            },
-            rewards: {
-                recipients: [
-                    {
-                        recipient: creatorAddress,
-                        admin: creatorAddress,
-                        bps: CONFIG.CREATOR_FEE_BPS,
-                        token: 'Paired',
-                    },
-                    {
-                        recipient: CONFIG.DEPLOYER_ADDRESS,
-                        admin: CONFIG.DEPLOYER_ADDRESS,
-                        bps: CONFIG.DEPLOYER_FEE_BPS,
-                        token: 'Paired',
-                    },
-                ],
-            },
+            rewardRecipients,
         };
         
-        if (tokenData.imageUrl) deployConfig.image = tokenData.imageUrl;
+        // Send transaction
+        const hash = await walletClient.writeContract({
+            address: CLANKER_FACTORY,
+            abi: CLANKER_ABI,
+            functionName: 'deployToken',
+            args: [deployParams],
+        });
         
-        const { txHash, waitForTransaction, error } = await clanker.deploy(deployConfig);
-        if (error) throw error;
+        console.log(`   TX: ${hash}`);
         
-        console.log(`   TX Hash: ${txHash}`);
-        const { address } = await waitForTransaction();
+        // Wait for confirmation
+        const receipt = await publicClient.waitForTransactionReceipt({ hash });
         
-        console.log(`   ✅ Token deployed at: ${address}`);
+        // Get token address from logs
+        const tokenAddress = receipt.logs[0]?.address || 'Check BaseScan';
+        
+        console.log(`   ✅ Deployed: ${tokenAddress}`);
         
         return {
             success: true,
-            address,
-            txHash,
-            clankerUrl: `https://clanker.world/clanker/${address}`,
-            basescanUrl: `https://basescan.org/token/${address}`,
+            address: tokenAddress,
+            txHash: hash,
         };
-    } catch (error) {
-        console.error(`   ❌ Deployment failed: ${error.message}`);
-        return { success: false, error: error.message };
+    } catch (e) {
+        console.error(`   ❌ Failed: ${e.message}`);
+        return { success: false, error: e.message };
     }
 }
 
 // ============================================
-// MAIN BOT LOGIC
+// MAIN BOT
 // ============================================
-const processedPosts = new Set();
+const processed = new Set();
 
 async function processMoltrCommand(post) {
-    const postId = post.id;
-    const author = post.author?.username || post.author;
-    const content = post.content;
+    const { id, content, author } = post;
+    const username = author?.username || author;
     
-    if (processedPosts.has(postId)) return;
-    processedPosts.add(postId);
+    if (processed.has(id)) return;
+    processed.add(id);
     
-    console.log(`\n📬 Processing !moltr command from @${author}`);
+    console.log(`\n📬 Processing from @${username}`);
     
     const parsed = parseMoltrCommand(content);
     if (!parsed) return;
     
     if (parsed.error) {
-        await replyToPost(postId, `🦞 **Molterator Error**\n\n${parsed.error}\n\n**Format:**\n\`!moltr $TICKER TokenName "Description" https://image.png https://website.com 0xYourWallet\``);
+        await replyToPost(id, `🦞 **Error:** ${parsed.error}\n\n**Format:**\n\`!moltr $TICKER Name "Desc" https://img.png https://site.com 0xWallet\``);
         return;
     }
     
-    const creatorWallet = parsed.walletAddress;
+    await replyToPost(id, `🦞 **Launching ${parsed.name} ($${parsed.ticker})...**\n\n👛 \`${parsed.walletAddress.slice(0,6)}...${parsed.walletAddress.slice(-4)}\`\n\n⏳ Please wait...`);
     
-    await replyToPost(postId, `🦞 **Molterator Processing...**\n\nLaunching **${parsed.name}** ($${parsed.ticker}) on Base!\n\n👛 Creator: \`${creatorWallet.slice(0, 6)}...${creatorWallet.slice(-4)}\`\n\n⏳ Please wait...`);
-    
-    const result = await deployToken(parsed, creatorWallet);
+    const result = await deployToken(parsed, parsed.walletAddress);
     
     if (result.success) {
-        const websiteLink = parsed.websiteUrl ? `• [Website](${parsed.websiteUrl})\n` : '';
-        const successMessage = `🦞🚀 **TOKEN LAUNCHED!**
+        const msg = `🦞🚀 **LAUNCHED!**
 
-**${parsed.name}** ($${parsed.ticker}) is now live on Base!
+**${parsed.name}** ($${parsed.ticker})
 
-📍 **Contract:** \`${result.address}\`
-👛 **Creator:** \`${parsed.walletAddress}\`
+📍 \`${result.address}\`
+👛 \`${parsed.walletAddress}\`
 
-🔗 **Links:**
-${websiteLink}• [Clanker](${result.clankerUrl})
-• [BaseScan](${result.basescanUrl})
-• [Uniswap](https://app.uniswap.org/swap?outputCurrency=${result.address}&chain=base)
+🔗 [Clanker](https://clanker.world/clanker/${result.address}) | [BaseScan](https://basescan.org/token/${result.address}) | [Uniswap](https://app.uniswap.org/swap?outputCurrency=${result.address}&chain=base)
 
-💰 **Fee Split:** 80% Creator / 20% Deployer
+💰 80% Creator / 20% Deployer
 
-— Molterator $MOLTR 🦞`;
-        await replyToPost(postId, successMessage);
+— Molterator 🦞`;
+        await replyToPost(id, msg);
     } else {
-        await replyToPost(postId, `🦞 **Molterator Error**\n\nFailed to deploy **${parsed.name}** ($${parsed.ticker})\n\nError: ${result.error}`);
+        await replyToPost(id, `🦞 **Failed:** ${result.error}`);
     }
 }
 
-async function pollMoltbook() {
-    console.log('🔍 Checking Moltbook for !moltr commands...');
+async function poll() {
+    console.log('🔍 Checking Moltbook...');
     const posts = await fetchRecentPosts(50);
-    const moltrPosts = posts.filter(post => 
-        post.content?.toLowerCase().includes('!moltr') && !processedPosts.has(post.id)
-    );
+    const moltr = posts.filter(p => p.content?.toLowerCase().includes('!moltr') && !processed.has(p.id));
     
-    if (moltrPosts.length > 0) {
-        console.log(`📌 Found ${moltrPosts.length} new !moltr command(s)`);
-        for (const post of moltrPosts) {
-            await processMoltrCommand(post);
-            await new Promise(resolve => setTimeout(resolve, 5000));
-        }
+    for (const post of moltr) {
+        await processMoltrCommand(post);
+        await new Promise(r => setTimeout(r, 5000));
     }
 }
 
-async function startBot() {
+async function start() {
     console.log(`
-╔════════════════════════════════════════════════╗
-║  🦞 MOLTERATOR TOKEN LAUNCHER BOT 🦞           ║
-║  Monitoring Moltbook for !moltr commands       ║
-║  Deploying on Clanker V4 (Base)                ║
-║  Fee Split: 80% Creator / 20% Deployer         ║
-╚════════════════════════════════════════════════╝
-    `);
+╔═══════════════════════════════════════╗
+║  🦞 MOLTERATOR TOKEN LAUNCHER 🦞      ║
+║  Clanker V4 on Base                   ║
+║  80% Creator / 20% Deployer           ║
+╚═══════════════════════════════════════╝
+`);
+    console.log(`Deployer: ${CONFIG.DEPLOYER_ADDRESS}\n`);
     
-    console.log(`📊 Deployer: ${CONFIG.DEPLOYER_ADDRESS}`);
-    console.log(`⏱️  Poll Interval: ${CONFIG.POLL_INTERVAL_MS / 1000}s\n`);
+    await poll();
+    setInterval(poll, CONFIG.POLL_INTERVAL_MS);
     
-    await pollMoltbook();
-    setInterval(pollMoltbook, CONFIG.POLL_INTERVAL_MS);
-    
-    console.log('✅ Bot is running!\n');
+    console.log('✅ Running!\n');
 }
 
-startBot().catch(console.error);
+start().catch(console.error);
