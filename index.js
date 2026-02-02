@@ -150,9 +150,9 @@ async function getUserWalletAddress(username) {
 /**
  * Parse !moltr command from post content
  * 
- * Format: !moltr $TICKER TokenName "Description" https://image.url
+ * Format: !moltr $TICKER TokenName "Description" https://image.url https://website.url 0xWalletAddress
  * 
- * Returns: { ticker, name, description, imageUrl } or null
+ * Returns: { ticker, name, description, imageUrl, websiteUrl, walletAddress } or null
  */
 function parseMoltrCommand(content) {
     // Check if post contains !moltr command
@@ -164,6 +164,8 @@ function parseMoltrCommand(content) {
     const tickerPattern = /\$([A-Z0-9]+)/i;
     const imagePattern = /(https?:\/\/[^\s]+\.(png|jpg|jpeg|gif|webp))/i;
     const descriptionPattern = /"([^"]+)"/;
+    const websitePattern = /(https?:\/\/[^\s]+(?<!\.(png|jpg|jpeg|gif|webp)))/gi;
+    const walletPattern = /(0x[a-fA-F0-9]{40})/;
     
     // Extract ticker
     const tickerMatch = content.match(tickerPattern);
@@ -172,9 +174,24 @@ function parseMoltrCommand(content) {
     }
     const ticker = tickerMatch[1].toUpperCase();
     
-    // Extract image URL
+    // Extract wallet address (0x + 40 hex characters)
+    const walletMatch = content.match(walletPattern);
+    const walletAddress = walletMatch ? walletMatch[1] : null;
+    
+    // Validate wallet if provided
+    if (!walletAddress) {
+        return { error: 'Missing wallet address (use 0x... format)' };
+    }
+    
+    // Extract image URL (must end with image extension)
     const imageMatch = content.match(imagePattern);
     const imageUrl = imageMatch ? imageMatch[1] : null;
+    
+    // Extract all URLs, then filter out image URLs to find website
+    const allUrls = content.match(websitePattern) || [];
+    const websiteUrl = allUrls.find(url => 
+        !url.match(/\.(png|jpg|jpeg|gif|webp)$/i)
+    ) || null;
     
     // Extract description (in quotes)
     const descMatch = content.match(descriptionPattern);
@@ -190,6 +207,8 @@ function parseMoltrCommand(content) {
         name,
         description,
         imageUrl,
+        websiteUrl,
+        walletAddress,
     };
 }
 
@@ -205,8 +224,15 @@ async function deployToken(tokenData, creatorAddress) {
     console.log(`   Creator: ${creatorAddress}`);
     console.log(`   Description: ${tokenData.description}`);
     console.log(`   Image: ${tokenData.imageUrl || 'none'}`);
+    console.log(`   Website: ${tokenData.websiteUrl || 'none'}`);
     
     try {
+        // Build social media URLs array
+        const socialMediaUrls = ['https://moltbook.com'];
+        if (tokenData.websiteUrl) {
+            socialMediaUrls.unshift(tokenData.websiteUrl);
+        }
+        
         const deployConfig = {
             name: tokenData.name,
             symbol: tokenData.ticker,
@@ -215,7 +241,7 @@ async function deployToken(tokenData, creatorAddress) {
             // Token metadata
             metadata: {
                 description: tokenData.description,
-                socialMediaUrls: ['https://moltbook.com'],
+                socialMediaUrls: socialMediaUrls,
             },
             
             // Context for tracking
@@ -323,39 +349,38 @@ async function processMoltrCommand(post) {
     
     if (parsed.error) {
         // Reply with error
-        await replyToPost(postId, `🦞 **Molterator Error**\n\n${parsed.error}\n\n**Correct format:**\n\`!moltr $TICKER TokenName "Description" https://image-url.png\``);
+        await replyToPost(postId, `🦞 **Molterator Error**\n\n${parsed.error}\n\n**Correct format:**\n\`!moltr $TICKER TokenName "Description" https://image.png https://website.com 0xYourWalletAddress\``);
         return;
     }
     
-    // Get creator's wallet address
-    const creatorWallet = await getUserWalletAddress(author);
-    
-    if (!creatorWallet) {
-        await replyToPost(postId, `🦞 **Molterator Notice**\n\n@${author}, you need to link a wallet address to your Moltbook profile before launching tokens.\n\nGo to your profile settings and add your Base wallet address.`);
-        return;
-    }
+    // Use wallet address from command
+    const creatorWallet = parsed.walletAddress;
     
     // Reply that we're processing
-    await replyToPost(postId, `🦞 **Molterator Processing...**\n\nLaunching **${parsed.name}** ($${parsed.ticker}) on Base via Clanker V4!\n\n⏳ Please wait for deployment confirmation...`);
+    await replyToPost(postId, `🦞 **Molterator Processing...**\n\nLaunching **${parsed.name}** ($${parsed.ticker}) on Base via Clanker V4!\n\n👛 Creator wallet: \`${creatorWallet.slice(0, 6)}...${creatorWallet.slice(-4)}\`\n\n⏳ Please wait for deployment confirmation...`);
     
     // Deploy the token
     const result = await deployToken(parsed, creatorWallet);
     
     if (result.success) {
+        // Build website link if provided
+        const websiteLink = parsed.websiteUrl ? `• [Website](${parsed.websiteUrl})\n` : '';
+        
         // Success reply
         const successMessage = `🦞🚀 **TOKEN LAUNCHED!**
 
 **${parsed.name}** ($${parsed.ticker}) is now live on Base!
 
 📍 **Contract:** \`${result.address}\`
+👛 **Creator:** \`${parsed.walletAddress}\`
 
 🔗 **Links:**
-• [View on Clanker](${result.clankerUrl})
+${websiteLink}• [View on Clanker](${result.clankerUrl})
 • [View on BaseScan](${result.basescanUrl})
 • [Trade on Uniswap](https://app.uniswap.org/swap?outputCurrency=${result.address}&chain=base)
 
 💰 **Fee Split:**
-• 80% → @${author} (creator)
+• 80% → Creator wallet
 • 20% → Molterator (deployer)
 
 *The shell protects, but wealth transcends.* 🦞
